@@ -1,106 +1,121 @@
 import torch
 import torch.nn as nn
-import torch.nn.Functional as F
+import torch.optim as optim
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-class AffectiveControlVectors(nn.Module):
+class NeuralAbstractionLayer(nn.Module):
+    def __init__(self, model_name='gpt2'):
+        super(NeuralAbstractionLayer, self).__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+
+    def encode(self, text):
+        inputs = self.tokenizer(text, return_tensors='pt')
+        outputs = self.model.transformer(**inputs)
+        hidden_states = outputs.last_hidden_state
+        return hidden_states, inputs['input_ids']
+    
+    def decode(self, hidden_states):
+        logits = self.model.lm_head(hidden_states)
+        probabilities = torch.softmax(logits, dim=-1)
+        predicted_ids = torch.argmax(probabilities, dim=-1)
+        text = self.tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+        return text
+    
+# Representation Reading Module
+class RepReader(nn.Module):
     def __init__(self, embedding_dim, num_affective_states):
-        super(AffectiveControlVectors, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.num_affective_states = num_affective_states
+        super(RepReader, self).__init__()
+        self.affective_classifier = nn.Linear(embedding_dim, num_affective_states)
 
-        # Initialize control vectors for each affective state
+    def forward(self, hidden_states):
+        pooled_rep = hidden_states.mean(dim=1)
+        affective_logits = self.affective_classifier(pooled_rep)
+        return affective_logits
+    
+    def adjust_representation(self, hidden_states, affective_state_indices, alpha=1.0):
+        adjustment = self.control_vectors[affective_state_indices].unsqueeze(1)
+        adjusted_rep = hidden_states + alpha * adjustment
+        return adjusted_rep
+
+# Representation Controller Module
+class RepController(nn.Module):
+    def __init__(self, embedding_dim, num_affective_states):
+        super(RepController, self).__init__()
         self.control_vectors = nn.Parameter(torch.randn(num_affective_states, embedding_dim))
 
-        # Reinforcement learning parameters
-        self.affective_state_rewards = torch.zeros(num_affective_states)
-        self.affective_state_usage_count = torch.zeros(num_affective_states)
-
-        # Exploration parameters
-        self.exploration_rate = 0.1 # Probability of selecting a random affective state
-
-    def forward(self, hidden_states, affective_state_index, alpha=1.0):
-        """
-        Adjusts the hidden states based on the selected affective state vector.
-
-        Parameters:
-        - hidden_states (torch.Tensor): the input hidden states from the language model
-        - affective_state_index (int, optional): Index of the desired affective stte. If None, selects based on exploration rate.
-        - alpha (float): The scaling factor of the control vector
-
-        Returns:
-        - adjusted_hidden_states (torch.Tensor): The modified hidden state
-        """
-
-        # Determine which affective state to use
-        if affective_state_index is None:
-            # Select affective state based on exploration vs exploitation
-            if torch.rand(1).item() < self.exploration_rate:
-                # Exploration: Randomly select an affective state
-                affective_state_index = torch.randint(0, self.num_affective_states, (1,)).item()
-            else:
-                # Exploitation: Select the affective state with the highest average reward
-                average_rewards = self.affective_state_rewards / (self.affective_state_usage_count + 1e-5)
-                affective_state_index = torch.argmax(average_rewards).item()
-
-        # Update usage count for the selected affective state
-        self.affective_state_usage_count[affective_state_index] += 1
-
-        # Retrieve the control vector for the selected affective state
-        control_vector = self.control_vectors[affective_state_index]
-
-        # Expand control vector to match hidden states shape
-        control_vector = control_vector.unsqueeze(0).expand_as(hidden_states)
-
-        # Adjust the hidden states using the control vector
-        adjusted_hidden_states = hidden_states + alpha * control_vector
-
-        return adjusted_hidden_states
+    def adjust_representation(self, hidden_states, affective_state_indices, alpha=1.0):
+        adjustment = self.control_vectors[affective_state_indices].unsqueeze(1)
+        adjusted_rep = hidden_states + alpha * adjustment
+        return adjusted_rep
     
-    def update_rewards(self, affective_state_index, reward):
-        """
-        Updates the reward value for a specific affective state based on feedback.
+# Training Module
+class AffectiveRLTrainer:
+    def __init__(self, model_name, embedding_dim, num_affective_states, learning_rate=1e-4, gamma=0.99):
+        self.neural_layer = NeuralAbstractionLayer(model_name)
+        self.rep_reader = RepReader(embedding_dim, num_affective_states)
+        self.rep_controller = RepController(embedding_dim, num_affective_states)
 
-        Parameters:
-        - affective_state_index (int): The index of the affective state to update.
-        - reward (float): The reward value to add for the affective state.
-        """
-        self.affective_state_rewards[affective_state_index] += reward
+        self.optimizer = optim.Adam(list(self.rep_reader.parameters()) + list(self.rep_controller.parameters()), lr=learning_rate)
+        self.gamma = gamma
 
-    def normalize_control_vectors(self):
-        """
-        Normalizes the control vectors to ensure stability in their magnitude.
-        """
-        with torch.no_grad():
-            self.control_vectors = nn.Parameter(F.normalize(self.control_vectors, p=2, dim=1))
+    def train_step(self, text, target_affective_state, reward_function):
+        hidden_states, input_ids = self.neural_layer.encode(text)
 
-    def anneal_exploration(self, decay_factor=0.99):
-        """
-        Gradually reduces the exploration rate over time.
+        # use representation reading to estimate current affective state
+        current_affective_logits = self.rep_reader(hidden_states)
+        current_affective_state = torch.argmax(current_affective_logits, dim=-1)
 
-        Parameters:
-        - decay_factor (float): The rate at which to decay the exploration parameter.
-        """
-        self.exploration_rate *= decay_factor
-        self.exploration_rate = max(self.exploration_rate, 0.01) # Maintain a minimum exploration rate for diversity
+        # use representation control to adjust representation towards target state
+        adjusted_hidden_states = self.rep_controller.adjust_representation(hidden_states, target_affective_state)
 
-# Example usage
+        # decode adjusted representation
+        adjusted_text = self.neural_layer.decode(adjusted_hidden_states)
+
+        # calculate reward based on adjusted text
+        reward = reward_function(adjusted_text, target_affective_state)
+
+        # compute loss and perform backpropagation
+        loss = -reward # Policy gradient: maximize reward
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def train(self, dataset, reward_function, num_epochs=10):
+        for epoch in range(num_epochs):
+            for text, target_affective_state in dataset:
+                self.train_step(text, target_affective_state, reward_function)
+
+# Reward Function
+class RewardFunction:
+    def __init__(self, target_affective_states):
+        self.target_affective_states = target_affective_states
+
+    def __call__(self, generated_text, target_affective_state):
+        # Calculate reward based on how closely the generated text matches the desired affective state
+        reward = self.calculate_reward(generated_text, target_affective_state)
+        return reward
+    
+    def calculate_reward(self, generated_text, target_affective_state):
+        # Specific reward logic here based on sentiment analysis, coherence, etc.
+        return torch.tensor(1.0) # to implement later
+    
+
+# Training loop
 if __name__ == "__main__":
     embedding_dim = 768
-    num_affective_states = 5
+    num_affective_states = 8
+    learning_rate = 1e-4
+    gamma = 0.99
+    model_name = 'gpt2' # replace with mistral model when code is updated to support it
+    reward_function = RewardFunction(target_affective_states=num_affective_states)
 
-    control_vectors_module = AffectiveControlVectors(embedding_dim, num_affective_states)
-    hidden_states = torch.randn(1, embedding_dim)
+    trainer = AffectiveRLTrainer(model_name, embedding_dim, num_affective_states, learning_rate, gamma)
 
-    # Adjust hidden states with a selected affective state
-    adjusted_hidden_states = control_vectors_module(hidden_states, affective_state_index=2, alpha=0.5)
+    dataset = [
+        ("this is a sad story.", 2)
+        ("I feel so happy today", 5)
+        # placeholders -- more samples to come
+    ]
 
-    # Simulate a reward update
-    control_vectors_module.update_rewards(affective_state_index=2, reward=1.0)
-
-    # Normalize control vectors periodically
-    control_vectors_module.normalize_control_vectors()
-
-    # Anneal exploration rate over time
-    control_vectors_module.anneal_exploration()
-
-    
+    trainer.train(dataset, reward_function, num_epochs=10)
